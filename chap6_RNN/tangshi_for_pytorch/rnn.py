@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 import numpy as np
 
-def weights_init(m):
+def weights_init(m): #给网络里的 Linear 层做初始化
     classname = m.__class__.__name__  #   obtain the class name
     if classname.find('Linear') != -1:
         weight_shape = list(m.weight.data.size())
@@ -32,7 +32,7 @@ class word_embedding(nn.Module):
         return sen_embed
 
 
-class RNN_model(nn.Module):
+class RNN_model(nn.Module): #用 LSTM 根据前文预测词表分布
     def __init__(self, batch_sz ,vocab_len ,word_embedding,embedding_dim, lstm_hidden_dim):
         super(RNN_model,self).__init__()
 
@@ -45,12 +45,16 @@ class RNN_model(nn.Module):
         # here you need to define the "self.rnn_lstm"  the input size is "embedding_dim" and the output size is "lstm_hidden_dim"
         # the lstm should have two layers, and the  input and output tensors are provided as (batch, seq, feature)
         # ???
-
-
+        self.rnn_lstm = nn.LSTM(
+            input_size=embedding_dim, #每个时间步输入一个词向量
+            hidden_size=lstm_hidden_dim, #LSTM 隐状态维度
+            num_layers=2,  #两层堆叠LSTM
+            batch_first=True
+        )
 
         ##########################################
         self.fc = nn.Linear(lstm_hidden_dim, vocab_len )
-        self.apply(weights_init) # call the weights initial function.
+        self.apply(weights_init) # call the weights initial function.遍历子模块并初始化 Linear
 
         self.softmax = nn.LogSoftmax() # the activation function.
         # self.tanh = nn.Tanh()
@@ -61,9 +65,9 @@ class RNN_model(nn.Module):
         # here you need to put the "batch_input"  input the self.lstm which is defined before.
         # the hidden output should be named as output, the initial hidden state and cell state set to zero.
         # ???
-
-
-
+        #h0 = Variable(torch.zeros(2, batch_input.size(0), self.lstm_dim).to(batch_input.device))
+        #c0 = Variable(torch.zeros(2, batch_input.size(0), self.lstm_dim).to(batch_input.device))
+        output, (hn, cn) = self.rnn_lstm(batch_input)
 
         ################################################
         out = output.contiguous().view(-1,self.lstm_dim)
