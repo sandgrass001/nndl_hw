@@ -1,171 +1,203 @@
 import numpy as np
 import collections
 import torch
-import torch.optim as optim
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
 
-import rnn
-
+# ======================
+# 基本配置
+# ======================
 start_token = 'G'
 end_token = 'E'
-batch_size = 64
+BATCH_SIZE = 64
+EPOCHS = 30
+LR = 0.0005
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def process_poems1(file_name):
-    poems = []
-    with open(file_name, "r", encoding='utf-8', ) as f:
-        for line in f.readlines():
-            try:
-                title, content = line.strip().split(':')
-                content = content.replace(' ', '')
-                if '_' in content or '(' in content or '（' in content or '《' in content or '[' in content or \
-                                start_token in content or end_token in content:
+# ======================
+# 数据集
+# ======================
+class PoemDataset(Dataset):
+    def __init__(self, file_name):
+        self.poems = []
+
+        with open(file_name, "r", encoding='utf-8') as f:
+            for line in f:
+                try:
+                    title, content = line.strip().split(':')
+                    content = content.replace(' ', '')
+
+                    if any(c in content for c in ['_', '(', '（', '《', '[']):
+                        continue
+                    if len(content) < 10 or len(content) > 80:
+                        continue
+
+                    content = start_token + content + end_token
+                    self.poems.append(content)
+                except:
                     continue
-                if len(content) < 5 or len(content) > 80:
-                    continue
-                content = start_token + content + end_token
-                poems.append(content)
-            except ValueError as e:
-                pass  # 删掉 print("error")
-    poems = sorted(poems, key=lambda line: len(line))
-    all_words = []
-    for poem in poems:
-        all_words += [word for word in poem]
-    counter = collections.Counter(all_words)
-    count_pairs = sorted(counter.items(), key=lambda x: -x[1])
-    words, _ = zip(*count_pairs)
-    words = words[:len(words)] + (' ',)
-    word_int_map = dict(zip(words, range(len(words))))
-    poems_vector = [list(map(word_int_map.get, poem)) for poem in poems]
-    return poems_vector, word_int_map, words
+
+        # 构建词表
+        all_words = []
+        for poem in self.poems:
+            all_words += list(poem)
+
+        counter = collections.Counter(all_words)
+        count_pairs = sorted(counter.items(), key=lambda x: -x[1])
+
+        self.words, _ = zip(*count_pairs)
+        self.words = list(self.words) + [' ']
+
+        self.word2idx = {w: i for i, w in enumerate(self.words)}
+        self.idx2word = dict(enumerate(self.words))
+
+        # 转 index
+        self.data = [
+            [self.word2idx.get(w, self.word2idx[' ']) for w in poem]
+            for poem in self.poems
+        ]
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        seq = self.data[idx]
+        return seq[:-1], seq[1:]
 
 
-def generate_batch(batch_size, poems_vec, word_to_int):
-    n_chunk = len(poems_vec) // batch_size
-    x_batches = []
-    y_batches = []
-    for i in range(n_chunk):
-        start_index = i * batch_size
-        end_index = start_index + batch_size
-        x_data = poems_vec[start_index:end_index]
-        y_data = []
-        for row in x_data:
-            y  = row[1:]
-            y.append(row[-1])
-            y_data.append(y)
-        x_batches.append(x_data)
-        y_batches.append(y_data)
-    return x_batches, y_batches
+# ======================
+# padding
+# ======================
+def collate_fn(batch):
+    x, y = zip(*batch)
+
+    max_len = max(len(seq) for seq in x)
+
+    def pad(seq):
+        return seq + [0] * (max_len - len(seq))
+
+    x = [pad(seq) for seq in x]
+    y = [pad(seq) for seq in y]
+
+    return torch.LongTensor(x), torch.LongTensor(y)
 
 
-def run_training():
-    poems_vector, word_to_int, vocabularies = process_poems1('./poems.txt')
-    print("finish loading data")
-    BATCH_SIZE = 64
+# ======================
+# 模型
+# ======================
+class PoemModel(nn.Module):
+    def __init__(self, vocab_size, embed_dim=128, hidden_dim=256):
+        super().__init__()
 
-    torch.manual_seed(5)
-    word_embedding = rnn.word_embedding(vocab_length= len(word_to_int) + 1 , embedding_dim= 100)
-    rnn_model = rnn.RNN_model(batch_sz = BATCH_SIZE,
-                              vocab_len = len(word_to_int) + 1,
-                              word_embedding = word_embedding,
-                              embedding_dim= 100,
-                              lstm_hidden_dim=128)
+        self.embed = nn.Embedding(vocab_size, embed_dim)
 
-    optimizer = optim.RMSprop(rnn_model.parameters(), lr=0.001)
-    loss_fun = torch.nn.NLLLoss()
+        self.lstm = nn.LSTM(
+            embed_dim,
+            hidden_dim,
+            num_layers=2,
+            dropout=0.3,
+            batch_first=True
+        )
 
-    for epoch in range(30):
-        batches_inputs, batches_outputs = generate_batch(BATCH_SIZE, poems_vector, word_to_int)
-        n_chunk = len(batches_inputs)
-        epoch_loss = 0
+        self.fc = nn.Linear(hidden_dim, vocab_size)
 
-        for batch in range(n_chunk):
-            batch_x = batches_inputs[batch]
-            batch_y = batches_outputs[batch]
+    def forward(self, x):
+        x = self.embed(x)
+        out, _ = self.lstm(x)
+        out = self.fc(out)
+        return out
 
-            batch_loss = 0
-            for index in range(BATCH_SIZE):
-                x = np.array(batch_x[index], dtype=np.int64)
-                y = np.array(batch_y[index], dtype=np.int64)
-                x = torch.from_numpy(x).unsqueeze(1)
-                y = torch.from_numpy(y)
-                
-                pre = rnn_model(x)
-                batch_loss += loss_fun(pre, y)
 
-                if batch == 0 and index == 0:
-                    _, pre_idx = torch.max(pre, dim=1)
-                    print(f'\nEpoch {epoch} 示例预测')
-                    print('预测:', pre_idx.data.tolist())
-                    print('目标:', y.data.tolist())
+# ======================
+# 训练（已添加：预测 vs 目标）
+# ======================
+def train():
+    dataset = PoemDataset('./poems.txt')
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
 
-            batch_loss = batch_loss / BATCH_SIZE
-            epoch_loss += batch_loss.item()
+    model = PoemModel(len(dataset.words)).to(DEVICE)
 
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    loss_fn = nn.CrossEntropyLoss(ignore_index=0)
+
+    for epoch in range(EPOCHS):
+        total_loss = 0
+
+        for batch_idx, (x, y) in enumerate(dataloader):
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            out = model(x)
+
+            # 计算损失
+            out_reshaped = out.reshape(-1, out.shape[-1])
+            y_reshaped = y.reshape(-1)
+            loss = loss_fn(out_reshaped, y_reshaped)
+
+            # 反向传播
             optimizer.zero_grad()
-            batch_loss.backward()
-            torch.nn.utils.clip_grad_norm_(rnn_model.parameters(), 1)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-            if batch % 20 == 0:
-                torch.save(rnn_model.state_dict(), './poem_generator_rnn')
+            total_loss += loss.item()
 
-        avg_epoch_loss = epoch_loss / n_chunk
-        print(f"Epoch {epoch:2d} 平均损失: {avg_epoch_loss:.4f}")
+            # ============ 【关键：每轮打印 预测 vs 目标】 ============
+            if batch_idx == 0:
+                # 取第一条数据查看
+                sample_out = out[0]
+                sample_y = y[0]
 
+                pred_idx = sample_out.argmax(dim=-1).cpu().numpy().tolist()
+                true_idx = sample_y.cpu().numpy().tolist()
 
-def to_word(predict, vocabs):
-    sample = np.argmax(predict)
-    if sample >= len(vocabs):
-        sample = len(vocabs) - 1
-    return vocabs[sample]
+                print(f"\n=== Epoch {epoch} 示例预测 ===")
+                print(f"预测: {pred_idx[:10]}")  # 只打印前10个，避免太长
+                print(f"目标: {true_idx[:10]}")
+                print("-" * 40)
+            # ======================================================
 
+        print(f"Epoch {epoch:2d} 平均Loss: {total_loss / len(dataloader):.4f}")
 
-def pretty_print_poem(poem):
-    shige=[]
-    for w in poem:
-        if w == start_token or w == end_token:
-            break
-        shige.append(w)
-    poem_sentences = poem.split('。')
-    for s in poem_sentences:
-        if s != '' and len(s) > 2:
-            print(s + '。')
+    torch.save(model.state_dict(), "poem_model.pt")
+    return model, dataset
 
 
-def gen_poem(begin_word):
-    poem = start_token + begin_word
-    word = begin_word
-    for _ in range(40):
-        input_idxs = [word_int_map.get(w, word_int_map[' ']) for w in poem]
-        input_tensor = torch.from_numpy(np.array(input_idxs, dtype=np.int64)).unsqueeze(1)
-        output = rnn_model(input_tensor, is_test=True)
-        word = to_word(output.data.tolist()[-1], vocabularies)
+# ======================
+# 生成
+# ======================
+def generate(model, dataset, start_word, max_len=40, temperature=0.8):
+    model.eval()
+
+    word = start_word
+    result = start_word
+    input_idx = torch.LongTensor([[dataset.word2idx.get(word, 0)]]).to(DEVICE)
+
+    for _ in range(max_len):
+        out = model(input_idx)
+        logits = out[:, -1, :] / temperature
+        prob = F.softmax(logits, dim=-1)
+        idx = torch.multinomial(prob, 1).item()
+        word = dataset.idx2word[idx]
+
         if word == end_token:
             break
-        poem += word
-    return poem[1:]
+
+        result += word
+        input_idx = torch.LongTensor([[idx]]).to(DEVICE)
+
+    return result
 
 
-# ==================== 运行 ====================
-run_training()  # 训练
+# ======================
+# 主程序
+# ======================
+if __name__ == "__main__":
+    model, dataset = train()
 
-# 加载模型生成诗歌
-poems_vector, word_int_map, vocabularies = process_poems1('./poems.txt')
-vocab_len = len(word_int_map) + 1
-
-word_embedding = rnn.word_embedding(vocab_length=vocab_len, embedding_dim=100)
-rnn_model = rnn.RNN_model(batch_sz=64,
-                         vocab_len=vocab_len,
-                         word_embedding=word_embedding,
-                         embedding_dim=100,
-                         lstm_hidden_dim=128)
-
-rnn_model.load_state_dict(torch.load('./poem_generator_rnn'))
-rnn_model.eval()
-
-keywords = ["日", "红", "山", "夜", "湖", "君", "海", "月"]
-for kw in keywords:
-    result = gen_poem(kw)
-    print(f"\n【{kw}】开头：")
-    pretty_print_poem(result)
-    print('-'*30)
+    keywords = ["日", "山", "夜", "月", "风"]
+    for kw in keywords:
+        poem = generate(model, dataset, kw, temperature=0.7)
+        print(f"\n【{kw}】开头的诗：")
+        print(poem)
+        print("-" * 30)
